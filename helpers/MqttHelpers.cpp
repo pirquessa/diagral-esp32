@@ -64,6 +64,7 @@ static const std::string MQTT_CLIENT_OTA_STATUS_ID = "ota_status";
 static const std::string MQTT_CLIENT_CONFIG_ID = "config";   // id for configuration components
 static const std::string MQTT_CLIENT_LOGGING_ID = "Logging"; // unique id and action for "Logging" component
 static const std::string MQTT_CLIENT_PASSIVE_ID = "Passive"; // unique id and action for "Passive" component
+static const std::string MQTT_CLIENT_ECO_ID = "Eco";
 
 static const std::string MQTT_CLIENT_CONTROL_PANEL_ID = "control_panel"; // control panel id
 static const std::string MQTT_CLIENT_CONTROL_PANEL_ACTION_ID = "action"; // control panel - action id
@@ -83,6 +84,43 @@ static LoggerCallback sLoggerCallback;                  // Callback to send logs
 
 namespace Helpers
 {
+    static void publish_config_state(esp_mqtt_client_handle_t client, const std::string &topicPrefix)
+    {
+        cJSON *configState = cJSON_CreateObject();
+        if (configState == nullptr)
+        {
+            DIAG_LOGE("Unable to create MQTT configuration state");
+            return;
+        }
+
+        const std::string logging = DiagralConfig::isLoggingEnabled() ? "ON" : "OFF";
+        const std::string passive = DiagralConfig::isPassiveModeEnabled() ? "ON" : "OFF";
+        const std::string eco = NetworkHelpers::IsEcoMode() ? "ON" : "OFF";
+        const bool error =
+            cJSON_AddStringToObject(configState, MQTT_CLIENT_LOGGING_ID.c_str(), logging.c_str()) == nullptr ||
+            cJSON_AddStringToObject(configState, MQTT_CLIENT_PASSIVE_ID.c_str(), passive.c_str()) == nullptr ||
+            cJSON_AddStringToObject(configState, MQTT_CLIENT_ECO_ID.c_str(), eco.c_str()) == nullptr;
+        if (error)
+        {
+            DIAG_LOGE("Unable to create MQTT configuration state fields");
+            cJSON_Delete(configState);
+            return;
+        }
+
+        char *payload = cJSON_PrintUnformatted(configState);
+        cJSON_Delete(configState);
+        if (payload == nullptr)
+        {
+            DIAG_LOGE("Unable to serialize MQTT configuration state");
+            return;
+        }
+
+        const std::string topic = topicPrefix + "/" + MQTT_CLIENT_CONFIG_ID + MQTT_CLIENT_STATE_TOPIC;
+        if (esp_mqtt_client_publish(client, topic.c_str(), payload, 0, 0, 1) < 0)
+            DIAG_LOGE("Unable to publish MQTT configuration state");
+        cJSON_free(payload);
+    }
+
     static void publish_ota_url(MqttHelpers *helper, esp_mqtt_client_handle_t client)
     {
         std::string url;
@@ -143,21 +181,7 @@ namespace Helpers
             const char *data = MQTT_CLIENT_BIRTH_MSG.c_str();
             msg_id = esp_mqtt_client_publish(client, topic.c_str(), data, 0, 0, 1);
             ESP_LOGD(TAG, "sent publish successful, msg_id=%d", msg_id);
-            // Send current config (logging, passive mode)
-            topic = mqttHelper->GetTopicPrefix() + "/" + MQTT_CLIENT_CONFIG_ID + MQTT_CLIENT_STATE_TOPIC;
-            cJSON *diagralConfig = cJSON_CreateObject();
-            if (diagralConfig != NULL)
-            {
-                bool error = false;
-                std::string logging = DiagralConfig::isLoggingEnabled() ? "ON" : "OFF";
-                std::string passive = DiagralConfig::isPassiveModeEnabled() ? "ON" : "OFF";
-                error = error || (cJSON_AddStringToObject(diagralConfig, MQTT_CLIENT_LOGGING_ID.c_str(), logging.c_str()) == NULL); // IoLogging
-                error = error || (cJSON_AddStringToObject(diagralConfig, MQTT_CLIENT_PASSIVE_ID.c_str(), passive.c_str()) == NULL); // IoPassive
-                const char *config = cJSON_Print(diagralConfig);
-                esp_mqtt_client_publish(client, topic.c_str(), config, 0, 0, 1);
-                cJSON_free((void *)config);
-                cJSON_Delete(diagralConfig);
-            }
+            publish_config_state(client, mqttHelper->GetTopicPrefix());
             // Send discovery
             mqttHelper->SendDiscovery();
             publish_ota_url(mqttHelper, client);
@@ -337,6 +361,30 @@ namespace Helpers
                             {
                                 DiagralConfig::ActivatePassiveMode(false);
                             }
+                        }
+                        cJSON *ecoItem = cJSON_GetObjectItem(root, MQTT_CLIENT_ECO_ID.c_str());
+                        if (cJSON_IsString(ecoItem))
+                        {
+                            if (event->retain)
+                            {
+                                DIAG_LOGE("Rejected retained Eco command; eco mode is not restored after reboot");
+                            }
+                            else
+                            {
+                                const std::string value(ecoItem->valuestring);
+                                bool requestedMode = false;
+                                if (value == "ON" || value == "OFF")
+                                {
+                                    requestedMode = value == "ON";
+                                    if (!NetworkHelpers::SetEcoMode(requestedMode))
+                                        DIAG_LOGE("Unable to apply requested Eco mode");
+                                }
+                                else
+                                {
+                                    DIAG_LOGE("Rejected invalid Eco mode value");
+                                }
+                            }
+                            publish_config_state(client, mqttHelper->GetTopicPrefix());
                         }
                         // Don't forget to delete JSON object to free memory!
                         cJSON_Delete(root);
@@ -794,6 +842,30 @@ namespace Helpers
                 error = error || (cJSON_AddStringToObject(cmp, "command_topic", command_topic.c_str()) == NULL); // command_topic
                 std::string command_template = "{\"" + MQTT_CLIENT_PASSIVE_ID + "\": \"{{ value }}\"}";
                 error = error || (cJSON_AddStringToObject(cmp, "command_template", command_template.c_str()) == NULL); // command_template
+            }
+        }
+        if (!error)
+        {
+            // Add "Eco" switch; state is volatile and retained commands are rejected.
+            cJSON *cmp = cJSON_AddObjectToObject(cmps, MQTT_CLIENT_ECO_ID.c_str());
+            if (cmp == NULL)
+                error = true;
+            else
+            {
+                error = error || (cJSON_AddStringToObject(cmp, "p", "switch") == NULL);
+                std::string unique_id = discoveryId + "_" + MQTT_CLIENT_ECO_ID;
+                error = error || (cJSON_AddStringToObject(cmp, "unique_id", unique_id.c_str()) == NULL);
+                error = error || (cJSON_AddStringToObject(cmp, "name", "Eco mode") == NULL);
+                error = error || (cJSON_AddBoolToObject(cmp, "optimistic", false) == NULL);
+                error = error || (cJSON_AddBoolToObject(cmp, "retain", false) == NULL);
+                std::string state_topic = mTopicPrefix + "/" + MQTT_CLIENT_CONFIG_ID + MQTT_CLIENT_STATE_TOPIC;
+                error = error || (cJSON_AddStringToObject(cmp, "state_topic", state_topic.c_str()) == NULL);
+                std::string value_template = "{{ value_json." + MQTT_CLIENT_ECO_ID + " }}";
+                error = error || (cJSON_AddStringToObject(cmp, "value_template", value_template.c_str()) == NULL);
+                std::string command_topic = mTopicPrefix + "/" + MQTT_CLIENT_CONFIG_ID + MQTT_CLIENT_COMMAND_TOPIC;
+                error = error || (cJSON_AddStringToObject(cmp, "command_topic", command_topic.c_str()) == NULL);
+                std::string command_template = "{\"" + MQTT_CLIENT_ECO_ID + "\": \"{{ value }}\"}";
+                error = error || (cJSON_AddStringToObject(cmp, "command_template", command_template.c_str()) == NULL);
             }
         }
         if (!error)

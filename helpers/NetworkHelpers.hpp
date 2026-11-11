@@ -12,6 +12,13 @@ namespace Helpers
         /// @brief Get current connection status
         /// @return true if currently connected to network, false otherwise
         static bool isConnected();
+
+        /// @brief Set Wi-Fi modem power saving. Ethernet builds do not support this mode.
+        /// @return true if the requested mode was applied
+        static bool SetEcoMode(bool ecoMode);
+
+        /// @brief Get the currently applied eco mode
+        static bool IsEcoMode();
     };
 
 }

@@ -23,6 +23,7 @@
 
 static const char *TAG = "networkHelper";
 static bool sIsConnected = false;
+static bool sEcoMode = false;
 static esp_netif_t *s_netif = nullptr;
 static Helpers::ConnectedCallback sConnectedCallback = nullptr;
 
@@ -343,5 +344,27 @@ namespace Helpers
     bool NetworkHelpers::isConnected()
     {
         return sIsConnected;
+    }
+
+    bool NetworkHelpers::SetEcoMode(bool ecoMode)
+    {
+#ifdef CONFIG_CONNECTIVITY_CHOICE_WIFI
+        const esp_err_t err = esp_wifi_set_ps(ecoMode ? WIFI_PS_MAX_MODEM : WIFI_PS_NONE);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Unable to set Wi-Fi power save: %s", esp_err_to_name(err));
+            return false;
+        }
+        sEcoMode = ecoMode;
+        return true;
+#else
+        ESP_LOGW(TAG, "Eco mode is only supported by Wi-Fi builds");
+        return false;
+#endif
+    }
+
+    bool NetworkHelpers::IsEcoMode()
+    {
+        return sEcoMode;
     }
 }
